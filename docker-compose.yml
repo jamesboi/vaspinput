@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  vasp-ai:
+    build: .
+    container_name: vasp_incar_app
+    ports:
+      - "8501:8501"
+    restart: always  # 服务器重启后自动拉起应用
+    environment:
+      - TZ=Asia/Shanghai  # 统一时区
