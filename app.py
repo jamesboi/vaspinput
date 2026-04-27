@@ -507,10 +507,9 @@ def analyze_incar(user_incar, poscar, calc_type):
             if sym not in poscar_el_seq:
                 poscar_el_seq.append(sym)
 
-    u_elements_found =[]
+    # ==== 【提取 U 值逻辑】 ====
     rec_u_list = []
     rec_ul_list = []
-    mag_elements_found =[]
     
     for sym in poscar_el_seq:
         u_val = 0
@@ -522,29 +521,16 @@ def analyze_incar(user_incar, poscar, calc_type):
             elif DFT_U_VALUES[sym]['f'] is not None and DFT_U_VALUES[sym]['f'] > 0:
                 u_val = DFT_U_VALUES[sym]['f']
                 u_l = 3
-            if u_val > 0:
-                u_elements_found.append(f"**{sym}** (U={u_val}eV)")
         rec_u_list.append(str(u_val))
         rec_ul_list.append(str(u_l))
-        
-        if sym in ELEMENT_MAGNETIC_MOMENTS and ELEMENT_MAGNETIC_MOMENTS[sym] > 0:
-            mag_elements_found.append(f"**{sym}**")
 
-    u_elements_found = list(dict.fromkeys(u_elements_found))
-    mag_elements_found = list(dict.fromkeys(mag_elements_found))
-    
-    # -----------------------------------------------------
-    # 【最严谨的物理属性判定，完美修复数组解析问题】
-    # -----------------------------------------------------
-    # 解析专家库 U 值
     expert_u_str = clean_val(expert_incar.get("LDAUU"))
     expert_ul_str = clean_val(expert_incar.get("LDAUL"))
     expert_u_list = [float(x) for x in expert_u_str.split() if x.replace('.','',1).lstrip('-').isdigit()]
-    expert_has_nonzero_u = any(x > 0 for x in expert_u_list)
     
+    expert_has_nonzero_u = any(x > 0 for x in expert_u_list)
     local_has_nonzero_u = any(float(x) > 0 for x in rec_u_list)
     
-    # 判断该材料是否在物理上需要加 U？(只要专家库或本地字典有一个觉得要加)
     needs_u_physical = local_has_nonzero_u or expert_has_nonzero_u
 
     if expert_has_nonzero_u and not local_has_nonzero_u:
@@ -554,16 +540,38 @@ def analyze_incar(user_incar, poscar, calc_type):
         final_rec_UU = " ".join(rec_u_list)
         final_rec_UL = " ".join(rec_ul_list)
 
-    # 磁性判定
+    # 构建带确切数值的 U 提示文本
+    u_summary_list = []
+    final_u_vals = final_rec_UU.split()
+    for idx, sym in enumerate(poscar_el_seq):
+        if idx < len(final_u_vals):
+            try:
+                val = float(final_u_vals[idx])
+                if val > 0:
+                    u_summary_list.append(f"**{sym}** (推荐 U={val} eV)")
+            except:
+                pass
+    u_summary_text = "、".join(u_summary_list) if u_summary_list else "无强关联原子，无需加 U"
+
+    # ==== 【提取磁矩逻辑】 ====
     expert_mag_str = clean_val(expert_incar.get("MAGMOM"))
     expert_has_mag = bool(expert_mag_str) and expert_mag_str != "未设置"
-    local_has_mag = bool(mag_elements_found)
     
-    # 体系是否在物理上需要开启自旋极化？
+    local_has_mag = False
+    for sym in poscar_el_seq:
+        if sym in ELEMENT_MAGNETIC_MOMENTS and ELEMENT_MAGNETIC_MOMENTS[sym] > 0:
+            local_has_mag = True
+            break
+
     needs_mag_physical = local_has_mag or expert_has_mag
     final_rec_mag = expert_mag_str if expert_has_mag else " ".join([str(ELEMENT_MAGNETIC_MOMENTS.get(sym, 0)) for sym in poscar_el_seq])
 
-    # 提取用户的【父级总开关】状态
+    # 包装系统综述对象，传给前端 UI 展示
+    system_summary = {
+        "elements": "、".join(poscar_el_seq),
+        "u_summary": u_summary_text
+    }
+
     is_user_ldau = parse_vasp_bool(user_incar.get("LDAU", False))
     is_user_spin = parse_vasp_bool(user_incar.get("ISPIN", False)) or str(user_incar.get("ISPIN", "")) in ["2", "2.0"]
     is_soc = parse_vasp_bool(user_incar.get("LSORBIT", False))
@@ -572,11 +580,8 @@ def analyze_incar(user_incar, poscar, calc_type):
 
     analysis_results = []
     top_warnings = []
-    
-    # 集合所有要审查的标签
     all_tags = set(user_incar.keys()).union(set(expert_incar.keys()))
     
-    # 【关键防越级注入】：只有当总开关需要被审查，或者用户强行写了子参数时，才纳入审查
     if needs_u_physical: all_tags.add("LDAU")
     if is_user_ldau: all_tags.update(["LDAUU", "LDAUL", "LMAXMIX"])
     if "LDAUU" in user_incar: all_tags.add("LDAUU")
@@ -603,15 +608,11 @@ def analyze_incar(user_incar, poscar, calc_type):
             
         advice = "✅ 设置正常"
         
-        # ====================================================
-        # 【完美分层物理逻辑防呆：主次依赖关系严格把控】
-        # ====================================================
-        
-        # ----- DFT+U 层级 -----
+        # ----- DFT+U 层级防呆 -----
         if tag == "LDAU":
             if needs_u_physical:
                 if not is_user_ldau:
-                    advice = f"🚨 核心总开关缺失: 体系含有强关联电子，必须开启总开关 LDAU=.TRUE.！"
+                    advice = f"🚨 核心总开关缺失: 体系包含强关联原子({u_summary_text})，强烈建议开启总开关 LDAU=.TRUE.！"
                     top_warnings.append(advice)
                 else:
                     advice = "✅ 总开关已开启，正在进一步校验子参数..."
@@ -649,11 +650,11 @@ def analyze_incar(user_incar, poscar, calc_type):
                 else:
                     advice = "✅ 未开启总开关，无需设置此项。"
 
-        # ----- 磁性层级 -----
+        # ----- 磁性层级防呆 -----
         elif tag == "ISPIN":
             if needs_mag_physical:
                 if not is_user_spin:
-                    advice = f"🚨 自旋总开关关闭: 体系含有磁性元素，必须开启自旋总开关 ISPIN=2！否则极易算错基态。"
+                    advice = f"🚨 自旋总开关关闭: 体系含有明显磁性元素，必须开启自旋总开关 ISPIN=2！否则极易算错基态。"
                     top_warnings.append(advice)
                 else:
                     advice = "✅ 自旋总开关已开启，正在进一步校验磁矩..."
@@ -677,7 +678,7 @@ def analyze_incar(user_incar, poscar, calc_type):
                 else:
                     advice = "✅ 未开启 ISPIN，无需设置磁矩。"
 
-        # ----- 混合参数层级 -----
+        # ----- 其他防呆 -----
         elif tag == "LMAXMIX":
             reasons = []
             if is_user_spin: reasons.append("自旋(ISPIN=2)")
@@ -697,7 +698,6 @@ def analyze_incar(user_incar, poscar, calc_type):
                 else:
                     advice = "✅ 无特殊物理需求，无需设置。"
 
-        # ----- 其他常规防呆 -----
         elif tag == "NSW":
             if user_val != "未设置" and int(user_val) > 0 and ibrion_val in ["-1", "未设置"]:
                 advice = "🚨 逻辑冲突: NSW>0 (要求结构弛豫)，但 IBRION=-1 (不准移动原子)，VASP 将直接报错停机！"
@@ -723,10 +723,8 @@ def analyze_incar(user_incar, poscar, calc_type):
                 advice = "⚠️ 半径缺失: LORBIT < 10 算 DOS 时，必须手动设置 RWIGS 原子半径数组！强烈建议直接改用 LORBIT = 11。"
                 top_warnings.append(advice)
 
-        # 常规通报处理
         if advice == "✅ 设置正常":
             if user_val == "未设置":
-                # 屏蔽专家库给出的一些无意义占位符导致的干扰
                 if expert_val != "未设置" and expert_val not in ["0", "0.0", "False", ""]:
                     advice = f"ℹ️ 未设置，使用VASP默认值。(高通量推荐: {expert_val})"
             elif expert_val != "未设置" and user_val != expert_val:
@@ -741,27 +739,23 @@ def analyze_incar(user_incar, poscar, calc_type):
         })
         
     df = pd.DataFrame(analysis_results)
-    # 按危险等级排序
     df['优先级'] = df['专家诊断与建议'].apply(
         lambda x: 0 if "🚨" in x else (1 if "⚠️" in x else (2 if "✅" in x else 3))
     )
     df = df.sort_values(by=['优先级', '参数标签 (Tag)']).drop(columns=['优先级']).reset_index(drop=True)
-    
-    # 警告去重
     top_warnings = list(dict.fromkeys(top_warnings))
-    return df, top_warnings, final_rec_UU, final_rec_UL, final_rec_mag, needs_u_physical, needs_mag_physical, poscar_el_seq
+    
+    return df, top_warnings, final_rec_UU, final_rec_UL, final_rec_mag, needs_u_physical, needs_mag_physical, system_summary
 
 # ==========================================
-# 网页前端渲染模块 (无隐形换行符纯净渲染)
+# 网页前端渲染模块
 # ==========================================
 def render_html_table(df):
     df_html = df.copy()
-    
     for col in df_html.columns:
         df_html[col] = df_html[col].astype(str).apply(lambda x: re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', x))
         
     raw_html = df_html.to_html(escape=False, index=False)
-    
     style = """
     <style>
     .vasp-table {
@@ -794,17 +788,14 @@ def render_html_table(df):
     }
     </style>
     """
-    
-    # 必须把 \n 彻底替换为空，这是防止 Streamlit 解析导致源码泄露的最强手段
     combined_html = (style + raw_html).replace('\n', '')
-    final_html = combined_html.replace('<table border="1" class="dataframe">', '<table class="vasp-table">')
-    return final_html
+    return combined_html.replace('<table border="1" class="dataframe">', '<table class="vasp-table">')
 
 # ==========================================
 # UI 交互逻辑
 # ==========================================
-st.title("🔬 VASP INCAR 专家级全量防呆审查系统")
-st.markdown("> **底层引擎**：材料库高通量物理规则 + **全量 250+ 参数百科**  |  **特色**：严谨物理层级判定、杜绝越级误报。")
+st.title("🔬 VASP INCAR 审查")
+st.markdown("> **底层引擎**：材料库高通量物理规则 + **全量 250+ 参数百科**  ")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -819,30 +810,34 @@ if incar_file and poscar_file:
         
         user_incar = Incar.from_str(incar_str)
         user_poscar = Poscar.from_str(poscar_str)
-        
         calc_type = guess_calculation_type(user_incar)
-        st.success(f"**🤖 AI 自动推断该任务类型为**: 【{calc_type}】")
         
         with st.spinner("🧠 正在执行全量参数库比对与物理层级校验..."):
-            df_result, top_warnings, final_rec_UU, final_rec_UL, final_rec_mag, needs_u, needs_mag, poscar_el_seq = analyze_incar(user_incar, user_poscar, calc_type)
+            df_result, top_warnings, final_rec_UU, final_rec_UL, final_rec_mag, needs_u, needs_mag, sys_summary = analyze_incar(user_incar, user_poscar, calc_type)
         
+        # -----------------------------
+        # 高清展示系统构成信息 (直击痛点)
+        # -----------------------------
+        st.info(f"""
+        #### 📋 体系物理特征
+        - **⚙️ 推断计算类型**：`{calc_type}`
+        - **🧪 体系元素组成**：`{sys_summary['elements']}`
+        - **🧲 DFT+U 需求判定**：{sys_summary['u_summary']}
+        """)
+
         if top_warnings:
-            st.markdown("### ⚠️ 核心物理报错速览")
+            st.markdown("### ⚠️ 核心报错速览")
             for warn in top_warnings:
-                display_warn = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', warn)
-                display_warn = display_warn.replace("<br>", " ")
-                if "🚨" in warn:
-                    st.error(display_warn, icon="🚨")
-                else:
-                    st.warning(display_warn, icon="⚠️")
+                display_warn = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', warn).replace("<br>", " ")
+                if "🚨" in warn: st.error(display_warn, icon="🚨")
+                else: st.warning(display_warn, icon="⚠️")
             st.markdown("---")
         
-        st.subheader("📊 INCAR 深度审查与参数全百科")
-        st.info("💡 下方表格支持文字自适应完全换行，不会折叠任何长文本。")
+        st.subheader("📊 INCAR 深度审查与参数百科")
         st.markdown(render_html_table(df_result), unsafe_allow_html=True)
         
         st.subheader("📥 智能纠错与补全：下载优化版 INCAR")
-        st.markdown("系统已保留您原有合理设置，并**在确保已开启总开关的前提下**，自动为您补全缺失的子参数。")
+        st.markdown("系统已保留您原有合理设置，并**在确保已开启总开关的前提下**，自动为您补全缺失的安全截断能、磁矩及U值参数。")
         
         expert_class = MPRelaxSet if "Relaxation" in calc_type else MPStaticSet
         perfect_incar = Incar(user_incar)
@@ -851,16 +846,14 @@ if incar_file and poscar_file:
         if "ENCUT" not in perfect_incar and "ENCUT" in expert_incar_data:
             perfect_incar["ENCUT"] = expert_incar_data["ENCUT"]
             
-        # 根据物理判定逻辑智能决定是否添加 U
         if needs_u:
             perfect_incar["LDAU"] = ".TRUE."
             perfect_incar["LDAUTYPE"] = 2
             perfect_incar["LDAUL"] = final_rec_UL
             perfect_incar["LDAUU"] = final_rec_UU
-            perfect_incar["LDAUJ"] = " ".join(["0"] * len(poscar_el_seq))
+            perfect_incar["LDAUJ"] = " ".join(["0"] * len(sys_summary['elements'].split('、')))
             perfect_incar["LMAXMIX"] = 6 if "3" in final_rec_UL else 4
             
-        # 根据物理判定逻辑智能决定是否添加磁矩
         if needs_mag:
             perfect_incar["ISPIN"] = 2
             if "MAGMOM" not in perfect_incar and final_rec_mag:
@@ -868,7 +861,7 @@ if incar_file and poscar_file:
             perfect_incar["LMAXMIX"] = 6 if "3" in final_rec_UL else 4
                 
         st.download_button(
-            label="🔽 下载 AI 修复补全版 INCAR",
+            label="🔽 下载修复补全版 INCAR",
             data=str(perfect_incar),
             file_name="INCAR_Optimized",
             mime="text/plain",
